@@ -204,3 +204,56 @@ def test_template_is_valid_and_ingestible(tmp_path):
     per_source, warnings = evidence.parse_records(parsed["records"])
     assert not warnings
     assert sum(len(v) for v in per_source.values()) == len(parsed["records"])
+
+
+def test_unknown_author_is_left_empty_not_fabricated():
+    """不得给缺失作者填占位名。
+
+    score.apply_per_author_cap 每作者最多保留 3 条，但对空作者不设上限。
+    若把未知作者写成"未知"，8 条无作者证据会被静默丢到只剩 3 条，
+    而运行摘要还会把损失归因于日期窗口。
+    """
+    from lib import score
+
+    records = [
+        {"source": "weibo", "url": f"https://weibo.com/x/{i}", "text": f"不同内容{i}"}
+        for i in range(8)
+    ]
+    per_source, warnings = evidence.parse_records(records)
+    items = per_source["weibo"]
+
+    assert not warnings
+    assert len(items) == 8
+    assert all(score.item_author(item) == "" for item in items)
+    # 关键断言：无作者不触发上限
+    assert len(score.apply_per_author_cap(items)) == 8
+    assert all("未知" not in (item.author_handle or "") for item in items)
+
+
+def test_real_shared_author_is_still_capped():
+    """回归守卫：真实的同一作者仍应受上限约束。"""
+    from lib import score
+
+    records = [
+        {"source": "weibo", "url": f"https://weibo.com/x/{i}",
+         "text": f"不同内容{i}", "author": "同一个账号"}
+        for i in range(8)
+    ]
+    per_source, _ = evidence.parse_records(records)
+    assert len(score.apply_per_author_cap(per_source["weibo"])) == 3
+
+
+def test_wechat_author_not_filled_with_domain():
+    """公众号名缺失时不能用 mp.weixin.qq.com 冒充发布者。"""
+    per_source, _ = evidence.parse_records([
+        {"source": "wechat", "url": "https://mp.weixin.qq.com/s/abc", "title": "文章"}
+    ])
+    assert per_source["wechat"][0].source_name == ""
+
+
+def test_baidu_source_domain_still_derived():
+    """百度结果的 source_domain 本就是从链接推导的真实信息，应保留。"""
+    per_source, _ = evidence.parse_records([
+        {"source": "baidu", "url": "https://news.example.com/a", "title": "报道"}
+    ])
+    assert per_source["baidu"][0].source_domain == "news.example.com"

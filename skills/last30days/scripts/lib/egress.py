@@ -15,6 +15,7 @@ Author: Jesse (https://github.com/Jesseovo)
 
 from __future__ import annotations
 
+import re
 import urllib.error
 from typing import Any, Optional
 
@@ -30,7 +31,6 @@ OTHER = "other"                     # 其他网络或未知故障
 # 那是登录态或 token 能解决的问题；若误判为出口拦截，会把用户引向
 # "去改网络策略" 这个错误结论。因此只匹配明确指向代理/隧道层的措辞。
 _BLOCKED_MARKERS = (
-    "tunnel connection failed",       # urllib/http.client CONNECT 被拒
     "cannot connect to proxy",
     "connect_rejected",               # 代理状态端点使用的措辞
     "proxy connection failed",
@@ -41,6 +41,15 @@ _BLOCKED_MARKERS = (
     "blocked by policy",
     "policy denial",
 )
+
+# CPython 的 http.client._tunnel 对**任何**非 200 的 CONNECT 响应都抛出
+#   OSError(f"Tunnel connection failed: {code} {message}")
+# 状态码是唯一能区分"策略拒绝"和"代理/上游瞬时故障"的信息，因此必须解析出来：
+# 只把鉴权/策略类状态码当作永久拒绝，5xx 与 429 属于瞬时故障，应当继续重试。
+_TUNNEL_RE = re.compile(r"tunnel connection failed:\s*(\d{3})")
+
+# 401/403/407 = 代理拒绝或要求鉴权；451 = 因法律原因不可用。均为永久性。
+_POLICY_TUNNEL_CODES = frozenset({401, 403, 407, 451})
 
 # 超时特征串
 _TIMEOUT_MARKERS = (
@@ -105,6 +114,15 @@ def is_policy_denial(error: Any) -> bool:
 
     for message in _iter_messages(error):
         lowered = message.lower()
+
+        # CONNECT 隧道失败：按状态码判定永久性，不能一概当作策略拒绝。
+        tunnel = _TUNNEL_RE.search(lowered)
+        if tunnel:
+            try:
+                return int(tunnel.group(1)) in _POLICY_TUNNEL_CODES
+            except ValueError:  # pragma: no cover - 正则已保证是三位数字
+                return False
+
         for marker in _BLOCKED_MARKERS:
             if marker in lowered:
                 return True

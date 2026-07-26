@@ -275,11 +275,11 @@ def _make_item(source: str, record: Dict[str, Any]):
 
     if source == "weibo":
         return schema.WeiboItem(
-            text=main, author_handle=author or "未知", engagement=engagement, **common
+            text=main, author_handle=author, engagement=engagement, **common
         )
     if source == "xiaohongshu":
         return schema.XiaohongshuItem(
-            title=main, desc=body, author_name=author or "未知",
+            title=main, desc=body, author_name=author,
             engagement=engagement, hashtags=_string_list(record.get("hashtags")),
             **common
         )
@@ -287,26 +287,26 @@ def _make_item(source: str, record: Dict[str, Any]):
         return schema.BilibiliItem(
             title=main,
             bvid=_first_text(record, "bvid") or _bvid_from_url(url),
-            channel_name=author or "未知",
+            channel_name=author,
             description=body, engagement=engagement,
             duration=_int_or_none(record.get("duration")), **common
         )
     if source == "zhihu":
         return schema.ZhihuItem(
-            title=main, excerpt=body, author=author or "未知",
+            title=main, excerpt=body, author=author,
             content_type=_first_text(record, "content_type") or "answer",
             engagement=engagement, **common
         )
     if source == "douyin":
         return schema.DouyinItem(
-            text=main, author_name=author or "未知", engagement=engagement,
+            text=main, author_name=author, engagement=engagement,
             hashtags=_string_list(record.get("hashtags")),
             duration=_int_or_none(record.get("duration")), **common
         )
     if source == "wechat":
         wechat_id = _first_text(record, "wechat_id")
         return schema.WechatItem(
-            title=main, snippet=body, source_name=author or _domain(url) or "未知",
+            title=main, snippet=body, source_name=author,
             wechat_id=wechat_id or None, **common
         )
     if source == "baidu":
@@ -319,7 +319,7 @@ def _make_item(source: str, record: Dict[str, Any]):
         hot_value = parse_count(record.get("hot_value"))
         return schema.ToutiaoItem(
             title=main, abstract=body,
-            source_name=author or _domain(url) or "未知",
+            source_name=author,
             is_hot=bool(record.get("is_hot")),
             hot_value=int(hot_value) if hot_value is not None else None,
             engagement=engagement, **common

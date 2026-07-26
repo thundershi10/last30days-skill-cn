@@ -448,6 +448,16 @@ def run_research(
                 results[source]["error"] = message
             return results
 
+        if egress_status.get("partially_blocked"):
+            # 部分主机被拒时无法逐源归因（适配器内部会吞掉异常），但必须让
+            # 调用方知道存在覆盖缺口，不要把"少数据"当成"讨论少"。
+            sys.stderr.write(
+                f"[出口预检] 警告: {egress_status.get('blocked_count')}/"
+                f"{egress_status.get('checked')} 个预检主机被代理拒绝；"
+                "部分源可能完全不可达，本轮结果存在覆盖缺口。\n"
+            )
+            sys.stderr.flush()
+
     futures = {}
     max_workers = len(active)
 

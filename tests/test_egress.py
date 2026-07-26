@@ -106,3 +106,26 @@ def test_blocked_markers_exclude_bare_403():
     """
     for marker in egress._BLOCKED_MARKERS:
         assert marker not in ("403", "forbidden", "dns", "name or service not known")
+
+
+def test_tunnel_status_code_decides_permanence():
+    """CPython 的 _tunnel 对任何非 200 都用同一句话报错。
+
+    只有鉴权/策略类状态码是永久拒绝；5xx / 429 是代理或上游的瞬时故障，
+    若一并判为永久，会让整轮抓取被错误跳过且不再重试。
+    """
+    permanent = {401: True, 403: True, 407: True, 451: True}
+    transient = {429: False, 500: False, 502: False, 503: False, 504: False}
+
+    for code, expected in {**permanent, **transient}.items():
+        error = urllib.error.URLError(OSError(f"Tunnel connection failed: {code} Msg"))
+        assert egress.is_policy_denial(error) is expected, f"tunnel {code}"
+        if expected:
+            assert egress.classify(error) == egress.EGRESS_BLOCKED
+        else:
+            assert egress.classify(error) != egress.EGRESS_BLOCKED
+
+
+def test_transient_tunnel_failure_is_retryable_classification():
+    error = urllib.error.URLError(OSError("Tunnel connection failed: 502 Bad Gateway"))
+    assert egress.is_blocked(error) is False

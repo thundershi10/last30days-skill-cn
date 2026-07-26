@@ -70,11 +70,9 @@ def test_probe_egress_does_not_flag_timeouts_as_blocked():
 
 
 def test_probe_egress_partial_block():
-    calls = {"n": 0}
-
-    def _side_effect(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
+    """按 URL 判定而非调用序号：探测是并发的，序号不可靠。"""
+    def _side_effect(url, *args, **kwargs):
+        if "bilibili" in url:
             raise _tunnel_denied()
         return {"data": {"result": [1]}}
 
@@ -84,3 +82,32 @@ def test_probe_egress_partial_block():
     assert status["blocked"] is False
     assert status["partially_blocked"] is True
     assert status["blocked_count"] == 1
+
+
+def test_probe_egress_not_blocked_when_search_fallback_reachable():
+    """cn.bing.com 是 5 个适配器共用的搜索兜底主机。
+
+    它还通，就不能宣布"全部被拦截"并跳过整轮抓取——那些源仍有取数路径。
+    """
+    def _side_effect(url, *args, **kwargs):
+        if "bing.com" in url:
+            return {"ok": True}
+        raise _tunnel_denied()
+
+    with patch("lib.env._probe_json", side_effect=_side_effect):
+        status = env.probe_egress()
+
+    assert status["blocked"] is False
+    assert status["partially_blocked"] is True
+
+
+def test_probe_egress_transient_tunnel_failure_is_not_a_block():
+    """代理返回 502 等瞬时隧道故障不得判定为永久策略拦截。"""
+    import urllib.error
+
+    transient = urllib.error.URLError(OSError("Tunnel connection failed: 502 Bad Gateway"))
+    with patch("lib.env._probe_json", side_effect=transient):
+        status = env.probe_egress()
+
+    assert status["blocked"] is False
+    assert status["blocked_count"] == 0
