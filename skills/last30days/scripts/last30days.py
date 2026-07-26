@@ -138,6 +138,8 @@ def _install_global_timeout(timeout_seconds: int):
 
 
 from lib import (
+    egress,
+    evidence,
     weibo,
     xiaohongshu,
     bilibili,
@@ -228,6 +230,137 @@ def _search_toutiao(topic, from_date, to_date, depth):
         return [], f"{type(e).__name__}: {e}"
 
 
+SOURCE_ORDER = (
+    "weibo", "xiaohongshu", "bilibili", "zhihu",
+    "douyin", "wechat", "baidu", "toutiao",
+)
+
+_RELEVANCE_KEYS = {
+    "weibo": "WEIBO",
+    "xiaohongshu": "XIAOHONGSHU",
+    "bilibili": "BILIBILI",
+    "zhihu": "ZHIHU",
+    "douyin": "DOUYIN",
+    "wechat": "WECHAT",
+    "baidu": "BAIDU",
+    "toutiao": "TOUTIAO",
+}
+
+
+def _score_items(source: str, items: list, query_type: str) -> list:
+    """按源调用对应打分器（微信/百度需要 query_type）。"""
+    if source == "weibo":
+        return score.score_weibo_items(items)
+    if source == "xiaohongshu":
+        return score.score_xiaohongshu_items(items)
+    if source == "bilibili":
+        return score.score_bilibili_items(items)
+    if source == "zhihu":
+        return score.score_zhihu_items(items)
+    if source == "douyin":
+        return score.score_douyin_items(items)
+    if source == "wechat":
+        return score.score_wechat_items(items, query_type=query_type)
+    if source == "baidu":
+        return score.score_baidu_items(items, query_type=query_type)
+    if source == "toutiao":
+        return score.score_toutiao_items(items)
+    return items
+
+
+def assemble_report(
+    topic: str,
+    from_date: str,
+    to_date: str,
+    query_type: str,
+    per_source_items: dict,
+    errors: dict = None,
+    mode: str = "all",
+) -> schema.Report:
+    """公共下游流水线：日期过滤 → 打分 → 排序 → 去重 → 相关性 → 作者上限 → 跨源关联 → 聚类。
+
+    实时抓取与证据注入共用同一条管线，保证两种来源产出的报告口径一致。
+    """
+    errors = errors or {}
+    processed = {}
+    for source in SOURCE_ORDER:
+        items = per_source_items.get(source) or []
+        items = normalize.filter_by_date_range(items, from_date, to_date)
+        items = _score_items(source, items, query_type)
+        items = score.sort_items(items, query_type=query_type)
+        items = getattr(dedupe, f"dedupe_{source}")(items)
+        items = score.relevance_filter(items, _RELEVANCE_KEYS[source])
+        items = score.apply_per_author_cap(items)
+        processed[source] = items
+
+    ordered = [processed[source] for source in SOURCE_ORDER]
+    dedupe.cross_source_link(*ordered)
+    clusters = cluster.build_clusters(*ordered)
+
+    report = schema.create_report(topic, from_date, to_date, mode)
+    report.clusters = clusters
+    for source in SOURCE_ORDER:
+        setattr(report, source, processed[source])
+        setattr(report, f"{source}_error", errors.get(source))
+    return report
+
+
+def _run_from_evidence(args) -> None:
+    """证据注入模式：读取外部采集的 JSON，走完整下游流水线产出报告。
+
+    用于出口被拦截、或需要用非本脚本渠道（如调用方的服务端检索）采集证据的场景。
+    报告 mode 标记为 ``evidence``，以便最终产出能明确区分数据来源。
+    """
+    try:
+        payload = evidence.load(args.from_evidence)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    topic = args.topic or payload.get("topic")
+    if not topic:
+        print("错误: 请提供研究主题，或在证据文件中设置 topic 字段。", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        from_date, to_date = dates.get_date_range(args.days, as_of=args.as_of)
+    except ValueError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    for warning in payload["warnings"]:
+        sys.stderr.write(f"[证据] 跳过 {warning}\n")
+    sys.stderr.write(
+        f"[证据] 接受 {payload['accepted']} 条，跳过 {len(payload['warnings'])} 条"
+        f"（文件: {args.from_evidence}）\n"
+    )
+    if payload.get("collected_via"):
+        sys.stderr.write(f"[证据] 采集渠道: {payload['collected_via']}\n")
+    if payload["accepted"] == 0:
+        sys.stderr.write("[证据] 警告: 没有任何可用记录，报告将为空。\n")
+    sys.stderr.flush()
+
+    report = assemble_report(
+        topic, from_date, to_date, qt.detect_query_type(topic),
+        payload["items"], mode="evidence",
+    )
+    report.context_snippet_md = render.render_context_snippet(report)
+    render.write_outputs(report)
+
+    total = sum(len(getattr(report, source, [])) for source in SOURCE_ORDER)
+    sys.stderr.write(f"\n完成! 共 {total} 条结果（证据注入模式，窗口内保留）\n")
+    sys.stderr.flush()
+
+    _emit(args, report)
+
+
+def _skip_egress_preflight() -> bool:
+    """是否跳过出口预检（离线测试或已知出口正常时可关闭）。"""
+    return os.environ.get("LAST30DAYS_SKIP_EGRESS_PREFLIGHT", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+
+
 def _cache_sources_token(depth: str, search_sources: set, query_type: str) -> str:
     source_part = ",".join(sorted(search_sources)) if search_sources else f"auto:{query_type}"
     return f"{depth}|{source_part}"
@@ -290,6 +423,30 @@ def run_research(
         active = {s for s in all_sources if qt.is_source_enabled(s, query_type)}
 
     results = {src: {"items": [], "error": None} for src in all_sources}
+
+    # 出口预检。
+    #
+    # 各适配器内部有多级兜底链且会吞掉异常，所以"出口被策略拦截"在逐源结果里
+    # 会退化成"0 条结果、无错误"，进而被渲染成"近期数据较少"——错误归因。
+    # 策略拒绝是环境级、永久性的：预检一次即可判定，同时省下几十个必然失败的
+    # 请求。仅当所有预检主机都被明确策略拒绝才判定为拦截（超时不算），
+    # 因此不会把瞬时故障误判成拦截。
+    if not _skip_egress_preflight():
+        egress_status = env.probe_egress()
+        if egress_status.get("blocked"):
+            message = egress.BLOCKED_SHORT
+            if egress_status.get("reason"):
+                message += f"：{egress_status['reason']}"
+            message += f"。{egress.BLOCKED_FIX}"
+            sys.stderr.write(
+                f"[出口预检] {egress_status.get('blocked_count')}/{egress_status.get('checked')} "
+                f"个预检主机被代理拒绝；跳过 {len(active)} 个数据源的抓取（重试无意义）。\n"
+            )
+            sys.stderr.write(f"[出口预检] {egress.BLOCKED_FIX}\n")
+            sys.stderr.flush()
+            for source in active:
+                results[source]["error"] = message
+            return results
 
     futures = {}
     max_workers = len(active)
@@ -361,6 +518,9 @@ def main():
     parser.add_argument("--no-cache", action="store_true", help="跳过缓存读取与写入")
     parser.add_argument("--refresh", action="store_true", help="忽略缓存并刷新结果")
     parser.add_argument("--cache-ttl", type=int, default=cache.DEFAULT_TTL_HOURS, metavar="HOURS", help="缓存有效期小时数")
+    parser.add_argument("--from-evidence", dest="from_evidence", type=str, default=None, metavar="FILE",
+                        help="证据注入模式：从 JSON 文件读取外部采集的记录，跳过实时抓取")
+    parser.add_argument("--evidence-template", action="store_true", help="打印证据 JSON 模板后退出")
 
     args = parser.parse_args()
     args.topic = " ".join(args.topic) if args.topic else None
@@ -382,6 +542,10 @@ def main():
     global_timeout = args.timeout or timeouts["global"]
     _install_global_timeout(global_timeout)
 
+    if args.evidence_template:
+        print(evidence.template_json())
+        sys.exit(0)
+
     config = env.get_config()
 
     if args.diagnose:
@@ -402,6 +566,10 @@ def main():
             results["env_written"] = False
         print(setup_wizard.get_setup_status_text(results))
         sys.exit(0)
+
+    if args.from_evidence:
+        _run_from_evidence(args)
+        return
 
     if not args.topic:
         print("错误: 请提供研究主题。", file=sys.stderr)
@@ -437,8 +605,8 @@ def main():
             report = schema.Report.from_dict(cached_data)
             report.from_cache = True
             report.cache_age_hours = age_hours
-            if not report.context_snippet_md:
-                report.context_snippet_md = render.render_context_snippet(report)
+            # 无条件重建：出口拦截等一次性诊断提示不应随缓存复现。
+            report.context_snippet_md = render.render_context_snippet(report)
             render.write_outputs(report)
             age_text = f"{age_hours:.1f}" if age_hours is not None else "未知"
             sys.stderr.write(f"⚡ 使用缓存结果（约 {age_text} 小时前，--refresh 可强制刷新）\n")
@@ -468,102 +636,35 @@ def main():
     sys.stderr.write("正在处理结果...\n")
     sys.stderr.flush()
 
-    norm_weibo = normalize.normalize_weibo_items(raw_results["weibo"]["items"], from_date, to_date)
-    norm_xhs = normalize.normalize_xiaohongshu_items(raw_results["xiaohongshu"]["items"], from_date, to_date)
-    norm_bili = normalize.normalize_bilibili_items(raw_results["bilibili"]["items"], from_date, to_date)
-    norm_zhihu = normalize.normalize_zhihu_items(raw_results["zhihu"]["items"], from_date, to_date)
-    norm_douyin = normalize.normalize_douyin_items(raw_results["douyin"]["items"], from_date, to_date)
-    norm_wechat = normalize.normalize_wechat_items(raw_results["wechat"]["items"], from_date, to_date)
-    norm_baidu = normalize.normalize_baidu_items(raw_results["baidu"]["items"], from_date, to_date)
-    norm_toutiao = normalize.normalize_toutiao_items(raw_results["toutiao"]["items"], from_date, to_date)
+    normalizers = {
+        "weibo": normalize.normalize_weibo_items,
+        "xiaohongshu": normalize.normalize_xiaohongshu_items,
+        "bilibili": normalize.normalize_bilibili_items,
+        "zhihu": normalize.normalize_zhihu_items,
+        "douyin": normalize.normalize_douyin_items,
+        "wechat": normalize.normalize_wechat_items,
+        "baidu": normalize.normalize_baidu_items,
+        "toutiao": normalize.normalize_toutiao_items,
+    }
+    per_source_items = {
+        source: normalizers[source](raw_results[source]["items"], from_date, to_date)
+        for source in SOURCE_ORDER
+    }
+    errors = {source: raw_results[source]["error"] for source in SOURCE_ORDER}
 
-    filt_weibo = normalize.filter_by_date_range(norm_weibo, from_date, to_date)
-    filt_xhs = normalize.filter_by_date_range(norm_xhs, from_date, to_date)
-    filt_bili = normalize.filter_by_date_range(norm_bili, from_date, to_date)
-    filt_zhihu = normalize.filter_by_date_range(norm_zhihu, from_date, to_date)
-    filt_douyin = normalize.filter_by_date_range(norm_douyin, from_date, to_date)
-    filt_wechat = normalize.filter_by_date_range(norm_wechat, from_date, to_date)
-    filt_baidu = normalize.filter_by_date_range(norm_baidu, from_date, to_date)
-    filt_toutiao = normalize.filter_by_date_range(norm_toutiao, from_date, to_date)
-
-    scored_weibo = score.score_weibo_items(filt_weibo)
-    scored_xhs = score.score_xiaohongshu_items(filt_xhs)
-    scored_bili = score.score_bilibili_items(filt_bili)
-    scored_zhihu = score.score_zhihu_items(filt_zhihu)
-    scored_douyin = score.score_douyin_items(filt_douyin)
-    scored_wechat = score.score_wechat_items(filt_wechat, query_type=query_type)
-    scored_baidu = score.score_baidu_items(filt_baidu, query_type=query_type)
-    scored_toutiao = score.score_toutiao_items(filt_toutiao)
-
-    sorted_weibo = score.sort_items(scored_weibo, query_type=query_type)
-    sorted_xhs = score.sort_items(scored_xhs, query_type=query_type)
-    sorted_bili = score.sort_items(scored_bili, query_type=query_type)
-    sorted_zhihu = score.sort_items(scored_zhihu, query_type=query_type)
-    sorted_douyin = score.sort_items(scored_douyin, query_type=query_type)
-    sorted_wechat = score.sort_items(scored_wechat, query_type=query_type)
-    sorted_baidu = score.sort_items(scored_baidu, query_type=query_type)
-    sorted_toutiao = score.sort_items(scored_toutiao, query_type=query_type)
-
-    deduped_weibo = dedupe.dedupe_weibo(sorted_weibo)
-    deduped_xhs = dedupe.dedupe_xiaohongshu(sorted_xhs)
-    deduped_bili = dedupe.dedupe_bilibili(sorted_bili)
-    deduped_zhihu = dedupe.dedupe_zhihu(sorted_zhihu)
-    deduped_douyin = dedupe.dedupe_douyin(sorted_douyin)
-    deduped_wechat = dedupe.dedupe_wechat(sorted_wechat)
-    deduped_baidu = dedupe.dedupe_baidu(sorted_baidu)
-    deduped_toutiao = dedupe.dedupe_toutiao(sorted_toutiao)
-
-    deduped_weibo = score.relevance_filter(deduped_weibo, "WEIBO")
-    deduped_xhs = score.relevance_filter(deduped_xhs, "XIAOHONGSHU")
-    deduped_bili = score.relevance_filter(deduped_bili, "BILIBILI")
-    deduped_zhihu = score.relevance_filter(deduped_zhihu, "ZHIHU")
-    deduped_douyin = score.relevance_filter(deduped_douyin, "DOUYIN")
-    deduped_wechat = score.relevance_filter(deduped_wechat, "WECHAT")
-    deduped_baidu = score.relevance_filter(deduped_baidu, "BAIDU")
-    deduped_toutiao = score.relevance_filter(deduped_toutiao, "TOUTIAO")
-
-    deduped_weibo = score.apply_per_author_cap(deduped_weibo)
-    deduped_xhs = score.apply_per_author_cap(deduped_xhs)
-    deduped_bili = score.apply_per_author_cap(deduped_bili)
-    deduped_zhihu = score.apply_per_author_cap(deduped_zhihu)
-    deduped_douyin = score.apply_per_author_cap(deduped_douyin)
-    deduped_wechat = score.apply_per_author_cap(deduped_wechat)
-    deduped_baidu = score.apply_per_author_cap(deduped_baidu)
-    deduped_toutiao = score.apply_per_author_cap(deduped_toutiao)
-
-    dedupe.cross_source_link(
-        deduped_weibo, deduped_xhs, deduped_bili, deduped_zhihu,
-        deduped_douyin, deduped_wechat, deduped_baidu, deduped_toutiao,
+    report = assemble_report(
+        args.topic, from_date, to_date, query_type, per_source_items, errors,
     )
-
-    clusters = cluster.build_clusters(
-        deduped_weibo, deduped_xhs, deduped_bili, deduped_zhihu,
-        deduped_douyin, deduped_wechat, deduped_baidu, deduped_toutiao,
-    )
-
-    report = schema.create_report(args.topic, from_date, to_date, "all")
-    report.clusters = clusters
-    report.weibo = deduped_weibo
-    report.xiaohongshu = deduped_xhs
-    report.bilibili = deduped_bili
-    report.zhihu = deduped_zhihu
-    report.douyin = deduped_douyin
-    report.wechat = deduped_wechat
-    report.baidu = deduped_baidu
-    report.toutiao = deduped_toutiao
-    report.weibo_error = raw_results["weibo"]["error"]
-    report.xiaohongshu_error = raw_results["xiaohongshu"]["error"]
-    report.bilibili_error = raw_results["bilibili"]["error"]
-    report.zhihu_error = raw_results["zhihu"]["error"]
-    report.douyin_error = raw_results["douyin"]["error"]
-    report.wechat_error = raw_results["wechat"]["error"]
-    report.baidu_error = raw_results["baidu"]["error"]
-    report.toutiao_error = raw_results["toutiao"]["error"]
 
     report.context_snippet_md = render.render_context_snippet(report)
     render.write_outputs(report)
     if not args.no_cache:
-        cache.save_cache(cache_key, report.to_dict())
+        # 出口被拦截产出的空报告不写缓存：否则一次环境层面的拦截会把"无数据"
+        # 冻结 24 小时，即使网络策略随后放开也会继续返回空结果。
+        if render.egress_diagnosis(report)["all_blocked"]:
+            sys.stderr.write("[缓存] 本次全部来源被出口拦截，跳过缓存写入。\n")
+        else:
+            cache.save_cache(cache_key, report.to_dict())
 
     total = sum(len(getattr(report, src, [])) for src in ["weibo", "xiaohongshu", "bilibili", "zhihu", "douyin", "wechat", "baidu", "toutiao"])
     sys.stderr.write(f"\n完成! 共 {total} 条结果\n")

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List
 
-from . import crawler_bridge, env
+from . import crawler_bridge, egress, env
 
 
 @dataclass
@@ -38,6 +38,7 @@ def build_report(config: Dict[str, Any]) -> Dict[str, Any]:
     """Build a source-by-source diagnostic report."""
     crawler_status = crawler_bridge.get_crawler_status()
     has_playwright = bool(crawler_status.get("playwright_available"))
+    egress_status = env.probe_egress()
 
     records: List[SourceRecord] = []
 
@@ -129,6 +130,45 @@ def build_report(config: Dict[str, Any]) -> Dict[str, Any]:
         "python scripts/last30days.py \"你的主题\" --search toutiao,baidu",
     ))
 
+    notes = [
+        "诊断结果表示当前机器上的配置/公开端点可用性；平台风控会随时间变化。",
+        "warn 不代表不可用，通常表示会走公开接口或搜索兜底，数据完整性可能较弱。",
+    ]
+
+    # 出口被策略拦截时，逐源的"配置是否齐备"已无参考价值：连接在鉴权前就被
+    # 切断，所有源实际都不可达。此时如实覆盖为 error，避免谎报"可用"。
+    if egress_status.get("blocked"):
+        blocked_reason = egress.BLOCKED_SHORT
+        if egress_status.get("reason"):
+            blocked_reason += f"：{egress_status['reason']}"
+        records = [
+            _record(
+                record.source,
+                record.label,
+                "error",
+                False,
+                blocked_reason,
+                # 修复建议已在顶部横幅与 notes 中给出，逐源不再重复整段文案。
+                "",
+                "",
+            )
+            for record in records
+        ]
+        notes = [
+            f"所有数据源均因出口策略被拦截而不可达（{egress_status.get('blocked_count')}/"
+            f"{egress_status.get('checked')} 个预检主机被拒）。",
+            egress.BLOCKED_FIX,
+            f"环境网络策略说明：{egress.BLOCKED_DOC_URL}",
+            "若需在拦截未解除的情况下产出报告，请改用证据注入模式："
+            "由具备联网能力的调用方收集证据后 --from-evidence 注入。",
+        ]
+    elif egress_status.get("partially_blocked"):
+        notes.insert(
+            0,
+            f"部分主机被出口策略拒绝（{egress_status.get('blocked_count')}/"
+            f"{egress_status.get('checked')}）；相关源可能完全不可达。",
+        )
+
     summary = {"ok": 0, "warn": 0, "error": 0}
     for record in records:
         summary[record.status] += 1
@@ -138,10 +178,8 @@ def build_report(config: Dict[str, Any]) -> Dict[str, Any]:
         "sources": [record.to_dict() for record in records],
         "crawler_engine": crawler_status,
         "xiaohongshu_api_base": env.get_xiaohongshu_api_base(config),
-        "notes": [
-            "诊断结果表示当前机器上的配置/公开端点可用性；平台风控会随时间变化。",
-            "warn 不代表不可用，通常表示会走公开接口或搜索兜底，数据完整性可能较弱。",
-        ],
+        "egress": egress_status,
+        "notes": notes,
     }
 
 
@@ -159,6 +197,19 @@ def render_text(report: Dict[str, Any]) -> str:
         f"可用 {summary.get('ok', 0)} / 警告 {summary.get('warn', 0)} / 错误 {summary.get('error', 0)}",
         "",
     ]
+
+    egress_status = report.get("egress") or {}
+    if egress_status.get("blocked"):
+        lines.extend([
+            f"❌ {egress.BLOCKED_LABEL}：{egress.BLOCKED_REASON}",
+            "   凭据无法补救：API token / Cookie / Playwright 都在连接建立之后才起作用。",
+            "",
+        ])
+    elif egress_status.get("partially_blocked"):
+        lines.extend([
+            f"⚠️ 出口部分被拦截（{egress_status.get('blocked_count')}/{egress_status.get('checked')} 个预检主机被拒）。",
+            "",
+        ])
     for source in report.get("sources", []):
         status = source.get("status", "warn")
         lines.append(f"{icon.get(status, '•')} {source.get('label')} ({source.get('source')}): {source.get('reason')}")

@@ -9,7 +9,7 @@ import tempfile
 from html import escape
 from pathlib import Path
 
-from . import schema
+from . import egress, schema
 from .version import DISPLAY_VERSION
 
 OUTPUT_DIR = Path.home() / ".local" / "share" / "last30days" / "out"
@@ -107,6 +107,71 @@ def _assess_data_freshness(report: schema.Report) -> dict:
         "is_sparse": recent < 5,
         "mostly_evergreen": total > 0 and recent < total * 0.3,
     }
+
+
+def _egress_diagnosis(report: schema.Report) -> dict:
+    """汇总"出口被策略拦截"的情况。
+
+    区分两件本质不同的事：
+      * 平台上确实没什么讨论（数据稀疏）——这是研究结论；
+      * 请求根本没发出去（出口被拦截）——这是采集失败。
+    把后者说成前者会误导最终判断，因此必须分开呈现。
+    """
+    blocked_labels = []
+    for source, (label, _badge) in SOURCE_META.items():
+        error = _err(report, f"{source}_error")
+        if error and egress.is_policy_denial(error):
+            blocked_labels.append(label)
+
+    total_items = sum(len(_items(report, source)) for source in SOURCE_META)
+    return {
+        "blocked_labels": blocked_labels,
+        "blocked": bool(blocked_labels),
+        "all_blocked": bool(blocked_labels) and total_items == 0,
+        "total_items": total_items,
+    }
+
+
+def egress_diagnosis(report: schema.Report) -> dict:
+    """``_egress_diagnosis`` 的公开别名，供调用方判断是否该写缓存。"""
+    return _egress_diagnosis(report)
+
+
+def _egress_notice_lines(diag: dict) -> list:
+    """出口拦截的 Markdown 提示（compact / md / context 共用）。"""
+    if not diag["blocked"]:
+        return []
+
+    labels = "、".join(diag["blocked_labels"])
+    if diag["all_blocked"]:
+        return [
+            f"**❌ 本次未采集到数据：{egress.BLOCKED_SHORT}**",
+            f"被拦截的源：{labels}。{egress.BLOCKED_REASON}",
+            "这不代表相关话题没有讨论，只代表本次请求未能发出——"
+            "请勿据此判断热度或情绪，也不要据此编造来源。",
+            f"处理办法：{egress.BLOCKED_FIX}",
+            "",
+        ]
+    return [
+        f"**⚠️ 部分数据源被拦截：{labels}**",
+        f"{egress.BLOCKED_SHORT}；下列结果仅覆盖未被拦截的源，存在覆盖缺口。",
+        "",
+    ]
+
+
+def _provenance_lines(report: schema.Report) -> list:
+    """证据注入模式的来源声明。
+
+    注入的数据不是平台原生抓取，若不声明，很容易被当成"平台实测情绪"引用。
+    """
+    if getattr(report, "mode", "") != "evidence":
+        return []
+    return [
+        "**ℹ️ 数据来源：证据注入模式（非平台原生抓取）**",
+        "本报告由外部采集的证据注入生成。请勿据此描述平台情绪分布、热度曲线或互动量级，"
+        "引用时以各条目的原始链接为准。",
+        "",
+    ]
 
 
 def _fmt_eng_weibo(eng) -> str:
@@ -226,8 +291,14 @@ def render_compact(report: schema.Report, limit: int = 15, missing_keys: str = "
         lines.append(f"*缓存命中：{age_text}生成。使用 `--refresh` 可强制刷新。*")
         lines.append("")
 
+    egress_diag = _egress_diagnosis(report)
+    lines.extend(_egress_notice_lines(egress_diag))
+    lines.extend(_provenance_lines(report))
+
     freshness = _assess_data_freshness(report)
-    if freshness["is_sparse"]:
+    # 全部源都被拦截时，"数据较少" 是错误归因：没有数据是因为请求没发出去，
+    # 而不是因为讨论少。此时只保留上面的拦截说明。
+    if freshness["is_sparse"] and not egress_diag["all_blocked"]:
         lines.append("**⚠️ 近期数据较少** — 近 30 天内可确认的讨论不多。")
         lines.append(f"仅 {freshness['total_recent']} 条可确认日期在 {report.range_from} 至 {report.range_to} 之间。")
         lines.append("下列结果可能含较早或常青内容，请向用户如实说明时效性。")
@@ -459,7 +530,11 @@ def render_source_status(report: schema.Report, source_info: dict = None) -> str
         lines.append(f"  ✅ {name}: {n} 条{extra}")
 
     def line_err(name: str, err: str):
-        lines.append(f"  ❌ {name}: 错误 — {err}")
+        # 出口拦截与"平台报错/反爬"是两回事，来源清单里也要能一眼区分。
+        if egress.is_policy_denial(err):
+            lines.append(f"  ⛔ {name}: {egress.BLOCKED_LABEL} — {err}")
+        else:
+            lines.append(f"  ❌ {name}: 错误 — {err}")
 
     weibo = _items(report, "weibo")
     weibo_e = _err(report, "weibo_error")
@@ -533,9 +608,13 @@ def render_context_snippet(report: schema.Report) -> str:
         "",
         f"*生成时间: {report.generated_at[:10]} | 模式: {report.mode}*",
         "",
+    ]
+    lines.extend(_egress_notice_lines(_egress_diagnosis(report)))
+    lines.extend(_provenance_lines(report))
+    lines.extend([
         "## 主要来源",
         "",
-    ]
+    ])
 
     all_items = []
     for item in _items(report, "weibo")[:5]:
@@ -584,6 +663,8 @@ def render_full_report(report: schema.Report) -> str:
         "",
     ]
 
+    lines.extend(_egress_notice_lines(_egress_diagnosis(report)))
+    lines.extend(_provenance_lines(report))
     lines.extend(_clusters_md_lines(report))
 
     wb = _items(report, "weibo")
@@ -900,9 +981,30 @@ def render_html_report(report: schema.Report) -> str:
         )
 
     source_summary = ", ".join(f"{SOURCE_META[s][0]} {n}" for s, n in active_sources) or "暂无可用来源"
+    egress_diag = _egress_diagnosis(report)
     sparse_note = ""
-    if freshness["is_sparse"]:
+    if egress_diag["all_blocked"]:
+        sparse_note = (
+            '<div class="notice">'
+            f'本次未采集到数据：{escape(egress.BLOCKED_SHORT)}。'
+            f'被拦截的源：{escape("、".join(egress_diag["blocked_labels"]))}。'
+            '这不代表相关话题没有讨论，仅代表请求未能发出。'
+            '</div>'
+        )
+    elif egress_diag["blocked"]:
+        sparse_note = (
+            '<div class="notice">'
+            f'部分数据源被出口策略拦截：{escape("、".join(egress_diag["blocked_labels"]))}，存在覆盖缺口。'
+            '</div>'
+        )
+    elif freshness["is_sparse"]:
         sparse_note = '<div class="notice">近期可确认数据较少，请在最终分析中明确说明时效性和覆盖限制。</div>'
+
+    if getattr(report, "mode", "") == "evidence":
+        sparse_note += (
+            '<div class="notice">数据来源：证据注入模式（非平台原生抓取）。'
+            '请勿据此描述平台情绪分布、热度曲线或互动量级。</div>'
+        )
 
     cluster_section = ""
     clusters = getattr(report, "clusters", None) or []

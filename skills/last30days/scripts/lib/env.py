@@ -12,6 +12,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from . import egress
+
 logger = logging.getLogger(__name__)
 
 # Legacy: empty registry so optional imports (e.g. setup_wizard) do not break.
@@ -240,7 +242,11 @@ def probe_bilibili(timeout: int = 5) -> bool:
         return bool(data.get("data", {}).get("result"))
     except urllib.error.HTTPError:
         return False
-    except Exception:
+    except Exception as exc:
+        # 出口被组织网络策略拒绝属于永久性故障：必须如实报告为不可用。
+        # 若在此 fail-open，--diagnose 会对完全不可达的源谎报"可用"。
+        if egress.is_policy_denial(exc):
+            return False
         return True
 
 
@@ -256,7 +262,11 @@ def probe_zhihu(timeout: int = 5) -> bool:
         return bool(data.get("data"))
     except urllib.error.HTTPError:
         return False
-    except Exception:
+    except Exception as exc:
+        # 出口被组织网络策略拒绝属于永久性故障：必须如实报告为不可用。
+        # 若在此 fail-open，--diagnose 会对完全不可达的源谎报"可用"。
+        if egress.is_policy_denial(exc):
+            return False
         return True
 
 
@@ -280,8 +290,53 @@ def probe_toutiao(timeout: int = 5) -> bool:
         return bool(data.get("data"))
     except urllib.error.HTTPError:
         return False
-    except Exception:
+    except Exception as exc:
+        # 出口被组织网络策略拒绝属于永久性故障：必须如实报告为不可用。
+        # 若在此 fail-open，--diagnose 会对完全不可达的源谎报"可用"。
+        if egress.is_policy_denial(exc):
+            return False
         return True
+
+
+# 出口预检使用的代表性主机：覆盖两个不同的平台域名，避免单站点故障误判。
+_EGRESS_PROBE_URLS = (
+    "https://api.bilibili.com/x/web-interface/search/type"
+    "?search_type=video&keyword=AI&page=1&page_size=1",
+    "https://m.weibo.cn/api/container/getIndex?containerid=100103type%3D1%26q%3DAI",
+)
+
+
+def probe_egress(timeout: int = 5) -> Dict[str, Any]:
+    """预检出口是否被组织网络策略拦截。
+
+    与 ``probe_*`` 不同，这里关心的不是"平台接口是否还返回数据"，而是
+    "连接能否建立"。若代理在 CONNECT 阶段就拒绝，任何凭据都无法补救。
+
+    Returns:
+        dict: ``blocked`` 全部被拦截；``partially_blocked`` 部分被拦截；
+        ``reason`` 首个拒绝原因；``checked`` / ``blocked_count`` 计数。
+    """
+    checked = 0
+    blocked_count = 0
+    reason = ""
+
+    for url in _EGRESS_PROBE_URLS:
+        checked += 1
+        try:
+            _probe_json(url, {"User-Agent": _PROBE_UA}, timeout)
+        except Exception as exc:  # 包含 HTTPError；只有策略拒绝才计数
+            if egress.is_policy_denial(exc):
+                blocked_count += 1
+                if not reason:
+                    reason = str(getattr(exc, "reason", None) or exc)
+
+    return {
+        "blocked": checked > 0 and blocked_count == checked,
+        "partially_blocked": 0 < blocked_count < checked,
+        "checked": checked,
+        "blocked_count": blocked_count,
+        "reason": reason,
+    }
 
 
 def _all_source_ids() -> List[str]:

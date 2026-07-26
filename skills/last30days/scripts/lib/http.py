@@ -15,6 +15,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from . import egress
 from .version import VERSION
 
 DEFAULT_TIMEOUT = 30
@@ -41,6 +42,14 @@ class HTTPError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+
+
+class EgressBlockedError(HTTPError):
+    """出口策略拒绝：代理在 TLS 握手前拒绝了 CONNECT。
+
+    这类失败是永久性的，因此 :func:`request` 不会重试，也不应被上层当作
+    "平台反爬" 处理——配置 token/Cookie/Playwright 都无法绕过。
+    """
 
 
 def _redact_url(url: str) -> str:
@@ -147,6 +156,16 @@ def request(
                 log(f"Error body: {snippet[:200]}")
             last_error = HTTPError(f"HTTP {e.code}: {e.reason}", e.code, body)
 
+            if egress.is_policy_denial(e):
+                # 407 是代理要求鉴权，属出口层问题；与平台反爬 403 性质不同，
+                # 后者仍可通过 token/Cookie 解决，不能混为一谈。
+                log("出口策略拒绝（代理要求鉴权），跳过重试")
+                raise EgressBlockedError(
+                    f"{egress.BLOCKED_LABEL}: HTTP {e.code} {e.reason}；{egress.BLOCKED_REASON}",
+                    e.code,
+                    body,
+                )
+
             # Don't retry client errors (4xx) except rate limits
             if 400 <= e.code < 500 and e.code != 429:
                 raise last_error
@@ -161,6 +180,12 @@ def request(
                 time.sleep(delay)
         except urllib.error.URLError as e:
             log(f"URL Error: {e.reason}")
+            if egress.is_policy_denial(e):
+                # 出口策略拒绝是永久性的：立即失败，不消耗重试预算。
+                log("出口策略拒绝（代理拒绝 CONNECT），跳过重试")
+                raise EgressBlockedError(
+                    f"{egress.BLOCKED_LABEL}: {e.reason}；{egress.BLOCKED_REASON}"
+                )
             last_error = HTTPError(f"URL Error: {e.reason}")
             if attempt < attempts - 1:
                 time.sleep(_compute_delay(attempt, base=backoff))
@@ -171,6 +196,11 @@ def request(
         except (OSError, TimeoutError, ConnectionResetError) as e:
             # Handle socket-level errors (connection reset, timeout, etc.)
             log(f"Connection error: {type(e).__name__}: {e}")
+            if egress.is_policy_denial(e):
+                log("出口策略拒绝（代理拒绝 CONNECT），跳过重试")
+                raise EgressBlockedError(
+                    f"{egress.BLOCKED_LABEL}: {e}；{egress.BLOCKED_REASON}"
+                )
             last_error = HTTPError(f"Connection error: {type(e).__name__}: {e}")
             if attempt < attempts - 1:
                 time.sleep(_compute_delay(attempt, base=backoff))
