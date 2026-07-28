@@ -84,6 +84,42 @@ def _clean_html(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def resolve_chromium_executable() -> Optional[str]:
+    """定位可用的 Chromium 可执行文件。
+
+    优先级：``PLAYWRIGHT_CHROMIUM_EXECUTABLE`` / ``CHROME_EXECUTABLE`` 显式指定 >
+    ``PLAYWRIGHT_BROWSERS_PATH`` 下已预装的 build > 返回 None（交给 Playwright
+    走默认解析）。
+
+    存在的意义：镜像里常预装 Chromium（如 ``chromium-1194``），但 pip 安装的
+    playwright 期望另一个 build 号（如 ``chromium_headless_shell-1228``），
+    此时裸 ``launch()`` 会失败并提示 "playwright install"——而在受限网络下
+    往往根本下载不了浏览器。
+    """
+    for var in ("PLAYWRIGHT_CHROMIUM_EXECUTABLE", "CHROME_EXECUTABLE"):
+        explicit = os.environ.get(var)
+        if explicit and Path(explicit).exists():
+            return explicit
+
+    browsers_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if not browsers_root:
+        return None
+
+    root = Path(browsers_root)
+    if not root.is_dir():
+        return None
+
+    # 完整版 chrome 优先于 headless_shell：后者不支持部分需要完整浏览器的场景
+    candidates = sorted(root.glob("chromium-*/chrome-linux/chrome"), reverse=True)
+    candidates += sorted(
+        root.glob("chromium_headless_shell-*/chrome-linux/headless_shell"), reverse=True
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 @contextmanager
 def _launch_browser_context(platform: str, mobile: bool = False, headless: bool = True):
     """统一构造 Playwright 浏览器上下文，自动加载并回写 cookies。
@@ -97,7 +133,13 @@ def _launch_browser_context(platform: str, mobile: bool = False, headless: bool 
     viewport = {"width": 390, "height": 844} if mobile else {"width": 1280, "height": 800}
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
+        launch_kwargs = {"headless": headless}
+        executable = resolve_chromium_executable()
+        if executable:
+            # 容器/CI 里常预装好 Chromium，但版本与当前 playwright 期望的
+            # build 号不一致，裸 launch() 会直接报 "Executable doesn't exist"。
+            launch_kwargs["executable_path"] = executable
+        browser = p.chromium.launch(**launch_kwargs)
         try:
             context = browser.new_context(
                 user_agent=ua,

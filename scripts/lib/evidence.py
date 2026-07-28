@@ -20,8 +20,10 @@ Author: Jesse (https://github.com/Jesseovo)
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -108,7 +110,9 @@ def parse_count(value: Any) -> Optional[float]:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return value
+        # nan / inf 会在下游 int() 时抛 ValueError，把整批注入打断，
+        # 违背"坏记录跳过、绝不崩溃"的约定。
+        return value if math.isfinite(value) else None
     if not isinstance(value, str):
         return None
 
@@ -121,13 +125,15 @@ def parse_count(value: Any) -> Optional[float]:
         if lowered.endswith(unit):
             head = lowered[: -len(unit)].strip()
             try:
-                return float(head) * factor
+                parsed = float(head) * factor
             except ValueError:
                 return None
+            return parsed if math.isfinite(parsed) else None
     try:
-        return float(text)
+        parsed = float(text)
     except ValueError:
         return None
+    return parsed if math.isfinite(parsed) else None
 
 _DATE_PATTERNS = (
     re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})"),
@@ -164,9 +170,13 @@ def normalize_date(value: Any) -> Optional[str]:
         match = pattern.match(text)
         if match:
             year, month, day = (int(g) for g in match.groups())
-            if not (1 <= month <= 12 and 1 <= day <= 31):
+            try:
+                # 必须构造真实日期：仅做 1-12 / 1-31 的分量检查会放行
+                # 2026-02-31 这类不存在的日期，而下游是按字符串比较，
+                # 于是它会被当作"高置信度且在窗口内"保留下来。
+                return datetime.date(year, month, day).isoformat()
+            except ValueError:
                 return None
-            return f"{year:04d}-{month:02d}-{day:02d}"
     return None
 
 

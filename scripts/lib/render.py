@@ -118,16 +118,36 @@ def _egress_diagnosis(report: schema.Report) -> dict:
     把后者说成前者会误导最终判断，因此必须分开呈现。
     """
     blocked_labels = []
+    blocked_ids = set()
     for source, (label, _badge) in SOURCE_META.items():
         error = _err(report, f"{source}_error")
         if error and egress.is_policy_denial(error):
             blocked_labels.append(label)
+            blocked_ids.add(source)
 
     total_items = sum(len(_items(report, source)) for source in SOURCE_META)
+    attempted = {s for s in (getattr(report, "attempted_sources", None) or []) if s in SOURCE_META}
+
+    if attempted:
+        # 判据不是"所有源都被拦"，而是"没有任何尝试过的源成功返回"。
+        #
+        # 若某个源顺利跑完却确实是 0 条，那是真实的数据稀疏，不能归因于出口
+        # （否则会压制稀疏提示并跳过缓存）；但若它是因为别的原因报错（例如
+        # 自建后端连不上），则本轮依然是颗粒无收 + 存在出口拦截，应当给出
+        # 明确的拦截结论，而不是退回"讨论不多"这种错误归因。
+        succeeded_empty = {
+            source for source in attempted
+            if not _err(report, f"{source}_error") and not _items(report, source)
+        }
+        all_blocked = total_items == 0 and bool(blocked_ids) and not succeeded_empty
+    else:
+        # 兼容不带 attempted_sources 的旧缓存报告
+        all_blocked = bool(blocked_ids) and total_items == 0
+
     return {
         "blocked_labels": blocked_labels,
         "blocked": bool(blocked_labels),
-        "all_blocked": bool(blocked_labels) and total_items == 0,
+        "all_blocked": all_blocked,
         "total_items": total_items,
     }
 

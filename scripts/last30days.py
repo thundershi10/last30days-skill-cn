@@ -276,6 +276,7 @@ def assemble_report(
     per_source_items: dict,
     errors: dict = None,
     mode: str = "all",
+    attempted: list = None,
 ) -> schema.Report:
     """公共下游流水线：日期过滤 → 打分 → 排序 → 去重 → 相关性 → 作者上限 → 跨源关联 → 聚类。
 
@@ -298,6 +299,7 @@ def assemble_report(
     clusters = cluster.build_clusters(*ordered)
 
     report = schema.create_report(topic, from_date, to_date, mode)
+    report.attempted_sources = sorted(attempted) if attempted else []
     report.clusters = clusters
     for source in SOURCE_ORDER:
         setattr(report, source, processed[source])
@@ -343,6 +345,7 @@ def _run_from_evidence(args) -> None:
     report = assemble_report(
         topic, from_date, to_date, qt.detect_query_type(topic),
         payload["items"], mode="evidence",
+        attempted=[s for s, items in payload["items"].items() if items],
     )
     report.context_snippet_md = render.render_context_snippet(report)
     render.write_outputs(report)
@@ -352,6 +355,40 @@ def _run_from_evidence(args) -> None:
     sys.stderr.flush()
 
     _emit(args, report)
+
+
+def _egress_exempt_sources(config: dict, active: set) -> set:
+    """返回不应因出口预检而被跳过的源。
+
+    预检只探测公共端点。以下路径**没有被探测过**，因此不能用预检结论替它们
+    下判断：
+      * 本机/局域网的自建后端（如默认的 XIAOHONGSHU_API_BASE 指向
+        host.docker.internal，压根不经过出口代理）；
+      * 用户显式配置了凭据的第三方后端，其域名可能已在允许清单内。
+    """
+    from urllib.parse import urlsplit
+
+    exempt = set()
+
+    api_base = env.get_xiaohongshu_api_base(config)
+    host = (urlsplit(api_base).hostname or "").lower()
+    if host in ("localhost", "127.0.0.1", "::1", "host.docker.internal") or host.endswith(".local"):
+        exempt.add("xiaohongshu")
+
+    if config.get("SCRAPECREATORS_API_KEY"):
+        exempt.add("xiaohongshu")
+    if config.get("WEIBO_ACCESS_TOKEN"):
+        exempt.add("weibo")
+    if config.get("TIKHUB_API_KEY") or config.get("DOUYIN_API_KEY"):
+        exempt.add("douyin")
+    if config.get("WECHAT_API_KEY"):
+        exempt.add("wechat")
+    if config.get("BAIDU_API_KEY") and config.get("BAIDU_SECRET_KEY"):
+        exempt.add("baidu")
+    if config.get("ZHIHU_COOKIE"):
+        exempt.add("zhihu")
+
+    return exempt & active
 
 
 def _skip_egress_preflight() -> bool:
@@ -423,6 +460,9 @@ def run_research(
         active = {s for s in all_sources if qt.is_source_enabled(s, query_type)}
 
     results = {src: {"items": [], "error": None} for src in all_sources}
+    # 记录本轮"打算尝试"的源，供渲染层判断是否所有尝试过的源都被拦截。
+    # 必须在任何收窄之前记录，且覆盖全拦截早退路径。
+    results["_attempted"] = sorted(active)
 
     # 出口预检。
     #
@@ -431,6 +471,7 @@ def run_research(
     # 策略拒绝是环境级、永久性的：预检一次即可判定，同时省下几十个必然失败的
     # 请求。仅当所有预检主机都被明确策略拒绝才判定为拦截（超时不算），
     # 因此不会把瞬时故障误判成拦截。
+    egress_blocked_with_fallback = False
     if not _skip_egress_preflight():
         egress_status = env.probe_egress()
         if egress_status.get("blocked"):
@@ -438,15 +479,30 @@ def run_research(
             if egress_status.get("reason"):
                 message += f"：{egress_status['reason']}"
             message += f"。{egress.BLOCKED_FIX}"
+            # 仍有未被探测到的路径（本地后端/已配置凭据）的源不能一并跳过，
+            # 否则会丢掉实际可达的取数通道。
+            exempt = _egress_exempt_sources(config, active)
+            skipped = active - exempt
+
             sys.stderr.write(
                 f"[出口预检] {egress_status.get('blocked_count')}/{egress_status.get('checked')} "
-                f"个预检主机被代理拒绝；跳过 {len(active)} 个数据源的抓取（重试无意义）。\n"
+                f"个预检主机被代理拒绝；跳过 {len(skipped)} 个数据源的抓取（重试无意义）。\n"
             )
             sys.stderr.write(f"[出口预检] {egress.BLOCKED_FIX}\n")
-            sys.stderr.flush()
-            for source in active:
+            for source in skipped:
                 results[source]["error"] = message
-            return results
+
+            if not exempt:
+                sys.stderr.flush()
+                return results
+
+            sys.stderr.write(
+                f"[出口预检] 仍尝试 {len(exempt)} 个另有取数路径的源："
+                f"{', '.join(sorted(exempt))}（本地后端或已配置凭据，未被预检覆盖）。\n"
+            )
+            sys.stderr.flush()
+            active = exempt
+            egress_blocked_with_fallback = True
 
         if egress_status.get("partially_blocked"):
             # 部分主机被拒时无法逐源归因（适配器内部会吞掉异常），但必须让
@@ -503,6 +559,17 @@ def run_research(
             except Exception as e:
                 results[source]["error"] = f"{type(e).__name__}: {e}"
                 sys.stderr.write(f"[{source}] 错误: {e}\n")
+
+    if egress_blocked_with_fallback:
+        # 出口已确认被拦截，这些源只是"另有一条未被预检覆盖的路径"才获准尝试。
+        # 适配器会吞掉异常并返回空，若不在此如实标注，渲染层会把它当成
+        # "顺利跑完但确实没内容"，从而把本轮误判成数据稀疏而非采集失败。
+        for source in active:
+            if not results[source]["items"] and not results[source]["error"]:
+                results[source]["error"] = (
+                    "已尝试未被出口预检覆盖的备用路径（本地后端或已配置凭据），"
+                    "但未取到数据；本轮其余源均因出口策略被拦截。"
+                )
 
     sys.stderr.flush()
     return results
@@ -664,6 +731,7 @@ def main():
 
     report = assemble_report(
         args.topic, from_date, to_date, query_type, per_source_items, errors,
+        attempted=raw_results.get("_attempted"),
     )
 
     report.context_snippet_md = render.render_context_snippet(report)

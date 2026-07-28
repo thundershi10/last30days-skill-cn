@@ -257,3 +257,37 @@ def test_baidu_source_domain_still_derived():
         {"source": "baidu", "url": "https://news.example.com/a", "title": "报道"}
     ])
     assert per_source["baidu"][0].source_domain == "news.example.com"
+
+
+def test_non_finite_counts_are_rejected():
+    """nan/inf 会在下游 int() 时抛 ValueError，打断整批注入。
+
+    约定是"坏记录跳过、绝不崩溃"，因此非有限数必须在解析阶段就被拒。
+    """
+    for bad in ("nan", "inf", "-inf", "Infinity", "NaN"):
+        assert evidence.parse_count(bad) is None, bad
+    assert evidence.parse_count(float("nan")) is None
+    assert evidence.parse_count(float("inf")) is None
+
+    per_source, _ = evidence.parse_records([
+        {"source": "weibo", "url": "https://a.com/1", "text": "x",
+         "engagement": {"likes": "nan"}}
+    ])
+    # 记录本身保留，只是互动数留空——不得因此崩溃
+    assert len(per_source["weibo"]) == 1
+    assert per_source["weibo"][0].engagement is None
+
+
+def test_impossible_calendar_dates_are_rejected():
+    """仅检查 1-12/1-31 会放行 2026-02-31，并被标成高置信度。"""
+    for bad in ("2026-02-31", "2026-04-31", "2026-02-30", "2026/13/01"):
+        assert evidence.normalize_date(bad) is None, bad
+    assert evidence.normalize_date("2026-02-28") == "2026-02-28"
+    assert evidence.normalize_date("2028-02-29") == "2028-02-29"  # 闰年
+
+    per_source, warnings = evidence.parse_records([
+        {"source": "weibo", "url": "https://a.com/1", "text": "x", "date": "2026-02-31"}
+    ])
+    item = per_source["weibo"][0]
+    assert item.date is None
+    assert item.date_confidence == "low"

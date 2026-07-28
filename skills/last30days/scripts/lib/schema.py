@@ -448,6 +448,9 @@ class Report:
     toutiao_error: Optional[str] = None
     from_cache: bool = False
     cache_age_hours: Optional[float] = None
+    # 本轮实际尝试过的源 id。用于区分"尝试了但没结果"与"压根没尝试"，
+    # 否则无法判断"是否所有尝试过的源都被拦截"。
+    attempted_sources: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -466,6 +469,7 @@ class Report:
             'wechat': [wc.to_dict() for wc in self.wechat],
             'baidu': [bd.to_dict() for bd in self.baidu],
             'toutiao': [t.to_dict() for t in self.toutiao],
+            'attempted_sources': self.attempted_sources,
             'best_practices': self.best_practices,
             'prompt_pack': self.prompt_pack,
             'context_snippet_md': self.context_snippet_md,
@@ -676,6 +680,7 @@ class Report:
             wechat=wechat_items,
             baidu=baidu_items,
             toutiao=toutiao_items,
+            attempted_sources=data.get('attempted_sources', []),
             best_practices=data.get('best_practices', []),
             prompt_pack=data.get('prompt_pack', []),
             context_snippet_md=data.get('context_snippet_md', ''),
