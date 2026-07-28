@@ -12,6 +12,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from . import egress
+
 logger = logging.getLogger(__name__)
 
 # Legacy: empty registry so optional imports (e.g. setup_wizard) do not break.
@@ -240,7 +242,11 @@ def probe_bilibili(timeout: int = 5) -> bool:
         return bool(data.get("data", {}).get("result"))
     except urllib.error.HTTPError:
         return False
-    except Exception:
+    except Exception as exc:
+        # 出口被组织网络策略拒绝属于永久性故障：必须如实报告为不可用。
+        # 若在此 fail-open，--diagnose 会对完全不可达的源谎报"可用"。
+        if egress.is_policy_denial(exc):
+            return False
         return True
 
 
@@ -256,7 +262,11 @@ def probe_zhihu(timeout: int = 5) -> bool:
         return bool(data.get("data"))
     except urllib.error.HTTPError:
         return False
-    except Exception:
+    except Exception as exc:
+        # 出口被组织网络策略拒绝属于永久性故障：必须如实报告为不可用。
+        # 若在此 fail-open，--diagnose 会对完全不可达的源谎报"可用"。
+        if egress.is_policy_denial(exc):
+            return False
         return True
 
 
@@ -280,8 +290,79 @@ def probe_toutiao(timeout: int = 5) -> bool:
         return bool(data.get("data"))
     except urllib.error.HTTPError:
         return False
-    except Exception:
+    except Exception as exc:
+        # 出口被组织网络策略拒绝属于永久性故障：必须如实报告为不可用。
+        # 若在此 fail-open，--diagnose 会对完全不可达的源谎报"可用"。
+        if egress.is_policy_denial(exc):
+            return False
         return True
+
+
+# 出口预检使用的代表性主机。
+#
+# 选host的两个考虑：
+#   1. 分属不同公司，避免单个站点故障就判定"全网被拦"；
+#   2. 必须包含 cn.bing.com——它是 baidu/toutiao/douyin/xiaohongshu/zhihu
+#      五个适配器共用的搜索兜底主机。只要它还通，这些源就仍有拿到数据的路径，
+#      因此不能宣布"全部被拦截"并跳过整轮抓取。
+_EGRESS_PROBE_URLS = (
+    "https://api.bilibili.com/x/web-interface/search/type"
+    "?search_type=video&keyword=AI&page=1&page_size=1",
+    "https://m.weibo.cn/api/container/getIndex?containerid=100103type%3D1%26q%3DAI",
+    "https://cn.bing.com/search?q=test",
+)
+
+EGRESS_PROBE_TIMEOUT = 3
+
+
+def _probe_one_egress(url: str, timeout: int):
+    """返回 (是否被策略拒绝, 原因文本)。"""
+    try:
+        _probe_json(url, {"User-Agent": _PROBE_UA}, timeout)
+    except Exception as exc:  # 包含 HTTPError；只有策略拒绝才算被拦
+        if egress.is_policy_denial(exc):
+            return True, str(getattr(exc, "reason", None) or exc)
+    return False, ""
+
+
+def probe_egress(timeout: int = EGRESS_PROBE_TIMEOUT) -> Dict[str, Any]:
+    """预检出口是否被组织网络策略拦截。
+
+    与 ``probe_*`` 不同，这里关心的不是"平台接口是否还返回数据"，而是
+    "连接能否建立"。若代理在 CONNECT 阶段就拒绝，任何凭据都无法补救。
+
+    只有**所有**预检主机都被明确策略拒绝才判定 ``blocked``：超时、DNS、
+    HTTP 错误都不计入，因此瞬时故障不会被误判成拦截。各主机并发探测，
+    避免在出口正常的环境里串行叠加延迟。
+
+    Returns:
+        dict: ``blocked`` 全部被拦截；``partially_blocked`` 部分被拦截；
+        ``reason`` 首个拒绝原因；``checked`` / ``blocked_count`` 计数。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    urls = list(_EGRESS_PROBE_URLS)
+    checked = len(urls)
+    blocked_count = 0
+    reason = ""
+
+    with ThreadPoolExecutor(max_workers=max(len(urls), 1)) as executor:
+        # 保持与 urls 相同的顺序，让 reason 稳定可复现
+        for is_blocked, detail in executor.map(
+            lambda u: _probe_one_egress(u, timeout), urls
+        ):
+            if is_blocked:
+                blocked_count += 1
+                if not reason:
+                    reason = detail
+
+    return {
+        "blocked": checked > 0 and blocked_count == checked,
+        "partially_blocked": 0 < blocked_count < checked,
+        "checked": checked,
+        "blocked_count": blocked_count,
+        "reason": reason,
+    }
 
 
 def _all_source_ids() -> List[str]:
